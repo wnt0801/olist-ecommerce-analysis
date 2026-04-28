@@ -482,39 +482,99 @@ order by cl.total_loss desc;
 */
 
 
--- 10.2 Voucher vs 信用卡在 300+ 高价区间的损失对比
-with order_payment as (select o.order_id,
-                              o.order_status,
-                              p.payment_type,
-                              sum(p.payment_value) as order_payment_value
-                       from olist_orders_dataset o
-                                join olist_order_payments_dataset p
-                                     on o.order_id = p.order_id
-                       group by o.order_id, o.order_status, p.payment_type)
-select payment_type                                               as '支付方式',
-       count(*)                                                   as '总订单数',
-       sum(case when order_status = 'canceled' then 1 else 0 end) as '取消订单数',
-       round(100.0 * sum(case when order_status = 'canceled' then 1 else 0 end)
-                 / count(*), 2)                                   as '取消率(%)',
-       round(sum(case
-                     when order_status = 'canceled'
-                         then order_payment_value
-                     else 0 end), 2)                              as '取消总金额',
-       round(avg(case
-                     when order_status = 'canceled'
-                         then order_payment_value end), 2)        as '取消均价'
-from order_payment
-where order_payment_value >= 300
-  and payment_type in ('credit_card', 'voucher')
+-- ============================================================
+-- 口径1：纯单一支付方式
+-- ============================================================
+with pure_payment as (
+    select order_id,
+           max(payment_type)        as payment_type,
+           sum(payment_value)       as order_payment_value
+    from olist_order_payments_dataset
+    group by order_id
+    having count(distinct payment_type) = 1
+)
+select payment_type                                                    as '支付方式',
+       count(*)                                                        as '总订单数',
+       sum(case when o.order_status = 'canceled' then 1 else 0 end)   as '取消订单数',
+       round(100.0 * sum(case when o.order_status = 'canceled' then 1 else 0 end)
+                 / count(*), 2)                                        as '取消率(%)'
+from pure_payment p
+         join olist_orders_dataset o on p.order_id = o.order_id
+where p.order_payment_value >= 300
+  and p.payment_type in ('credit_card', 'voucher')
 group by payment_type;
 
 /*
-纯 voucher 订单在 300+ 区间取消率高达 20%，是信用卡（0.79%）的 25 倍
-取消均价 voucher（1067）也高于信用卡（799），说明高价 voucher 订单反悔金额更大
-虽然 voucher 样本量只有 75 单，绝对数量小，但 20% 的取消率信号足够强，值得重点关注
-建议对 300+ 的纯 voucher 订单增加下单确认环节或设置 voucher 使用金额上限
+
+支付方式        总订单数    取消订单数   取消率(%)
+credit_card,    8268,     65,         0.79
+voucher,        75,       15,         20.00
+
 */
 
+-- ============================================================
+-- 口径2：按主支付方式（金额占比最大）
+-- ============================================================
+with payment_with_total as (
+    select order_id,
+           payment_type,
+           payment_value,
+           sum(payment_value) over (partition by order_id) as order_payment_value,
+           row_number() over (
+               partition by order_id
+               order by payment_value desc
+               )                                               as rn
+    from olist_order_payments_dataset
+),
+     dominant_payment as (
+         select order_id,
+                payment_type as dominant_type,
+                order_payment_value
+         from payment_with_total
+         where rn = 1
+     )
+select dominant_type                                                   as '支付方式',
+       count(*)                                                        as '总订单数',
+       sum(case when o.order_status = 'canceled' then 1 else 0 end)   as '取消订单数',
+       round(100.0 * sum(case when o.order_status = 'canceled' then 1 else 0 end)
+                 / count(*), 2)                                        as '取消率(%)'
+from dominant_payment d
+         join olist_orders_dataset o on d.order_id = o.order_id
+where d.order_payment_value >= 300
+  and d.dominant_type in ('credit_card', 'voucher')
+group by dominant_type;
+
+/*
+
+支付方式        总订单数    取消订单数   取消率(%)
+credit_card,    8378,     67,         0.80
+voucher,        167,       16,        9.58
+*/
+
+-- ============================================================
+-- 附：摸底混合支付占比（顺手确认污染程度）
+-- ============================================================
+with payment_category as (
+    select order_id,
+           count(distinct payment_type)  as type_count,
+           sum(payment_value)            as order_payment_value,
+           max(case when payment_type = 'voucher' then 1 else 0 end) as has_voucher,
+           max(case when payment_type = 'credit_card' then 1 else 0 end) as has_credit
+    from olist_order_payments_dataset
+    group by order_id
+)
+select case
+           when type_count = 1 and has_voucher = 1  then 'pure_voucher'
+           when type_count = 1 and has_credit = 1   then 'pure_credit_card'
+           when type_count > 1 and has_voucher = 1  then 'mixed_with_voucher'
+           when type_count > 1 and has_credit = 1   then 'mixed_with_credit'
+           else 'other'
+           end                                           as '分类',
+       count(*)                                      as '订单数',
+       sum(case when order_payment_value >= 300 then 1 else 0 end) as '其中300+订单数'
+from payment_category
+group by 1
+order by 2 desc;
 
 -- 10.3 干预价值估算：Voucher 取消率降到信用卡同水平能挽回多少
 with order_payment as (select o.order_id,
